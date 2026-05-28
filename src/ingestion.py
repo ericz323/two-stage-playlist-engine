@@ -1,0 +1,106 @@
+import polars as pl
+import json
+import glob
+from sqlalchemy import create_engine
+
+DB_URI = 'postgresql+psycopg://postgres:postgres123@localhost:5432/playlist_engine'
+# Directory for the MPD folder
+JSON_FOLDER = '../data/raw/spotify_mpd'
+
+
+def process_metadata():
+    """
+    Processes track metadata and uploads it to the PostgreSQL database.
+
+    Joins all unique tracks from the MPD to a song features dataset from Kaggle.
+    Tracks without song features from the Kaggle dataset have Null values.
+    """
+    print('Processing metadata...')
+    file_paths = glob.glob(f'{JSON_FOLDER}/mpd.slice.*.json')
+
+    # Skim MPD for all unique tracks
+    unique_tracks = set()
+    for i, file_path in enumerate(file_paths):
+        if i % 100 == 0:
+            print(f'Skimming file {i}/1000...')
+
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+            for playlist in data['playlists']:
+                for track in playlist['tracks']:
+                    clean_id = track['track_uri'].split(':')[-1]
+                    unique_tracks.add(clean_id)
+
+    print(f'Found {len(unique_tracks)} unique tracks across all playlists.')
+
+    # Convert the set to a DataFrame
+    df_all_tracks = pl.DataFrame({'track_id': list(unique_tracks)})
+
+    # Load and clean audio features dataset
+    print('Joining with audio features...')
+    df_features = pl.read_csv('../data/raw/tracks_features.csv').select([
+        pl.col('id').alias('track_id'),
+        pl.col('danceability'),
+        pl.col('tempo'),
+        pl.col('energy'),
+        pl.col('acousticness'),
+        pl.col('loudness'),
+        pl.col('valence')
+    ]).unique(subset=['track_id'])
+
+    # Add all unique tracks to metadata dataframe (fills missing values with Nulls)
+    df_metadata = df_all_tracks.join(df_features, on='track_id', how='left')
+
+    # Push catalog to Database
+    print('Uploading complete metadata catalog to PostgreSQL...')
+    df_metadata.write_database(
+        table_name='track_metadata',
+        connection=DB_URI,
+        if_table_exists='append',
+        engine='sqlalchemy'
+    )
+
+
+def process_interactions():
+    """
+    Processes track interactions from the MPD and uploads them to the PostgreSQL database.
+
+    We select only the playlist ID and track ID.
+    The MPD is processed one slice at a time to conserve memory.
+    """
+    print('Processing interactions...')
+    file_paths = glob.glob(f'{JSON_FOLDER}/mpd.slice.*.json')
+
+    # Process and upload one file at a time to save memory
+    for i, file_path in enumerate(file_paths):
+        interactions = []
+
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+            for playlist in data['playlists']:
+                pid = playlist['pid']
+                for track in playlist['tracks']:
+                    clean_id = track['track_uri'].split(':')[-1]
+                    interactions.append((pid, clean_id))
+
+        # Build DataFrame for just this ONE slice
+        df_batch = pl.DataFrame(interactions, schema=['playlist_id', 'track_id'], orient='row')
+
+        # Append directly to database
+        df_batch.write_database(
+            table_name='interaction_matrix',
+            connection=DB_URI,
+            if_table_exists='append',
+            engine='sqlalchemy'
+        )
+
+        if i % 50 == 0:
+            print(f'Successfully piped {i}/1000 slices to database...')
+
+    print('Successfully ingested all interactions.')
+
+
+if __name__ == '__main__':
+    engine = create_engine(DB_URI)
+    process_metadata()
+    process_interactions()
